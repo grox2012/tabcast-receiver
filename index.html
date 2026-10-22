@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<!--
+  TabCast Relay — Custom Web Receiver.
+
+  On a real Chromecast / Google TV this page is launched by our own
+  receiver App ID (registered in the Google Cast Developer Console, hosted
+  over HTTPS) and receives the stream URLs from the sender through the
+  custom namespace urn:x-cast:com.tabcast.relay:
+      { "whepUrl": "...", "hlsUrl": "...", "token": "" }
+
+  Opened in a normal browser (no Cast framework), it runs in standalone
+  mode and reads the same values from query parameters, which is how the
+  WHEP player is verified without a TV:
+      receiver.html?whep=http://127.0.0.1:8889/tabcast/whep
+                    &hls=http://127.0.0.1:8888/tabcast/index.m3u8
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<title>TabCast Relay Receiver</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; height: 100%; overflow: hidden; }
+  #media { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #hud {
+    position: absolute; left: 24px; bottom: 24px; color: #e8eef3;
+    font-family: system-ui, sans-serif; font-size: 20px;
+    background: rgba(10, 16, 22, .72); padding: 10px 16px; border-radius: 10px;
+    max-width: 80%; word-break: break-all;
+  }
+  #hud.small { font-size: 14px; opacity: .75; }
+  #playButton {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    font-size: 22px; padding: 14px 28px; border-radius: 10px; border: 0;
+    background: #1668b4; color: #fff; cursor: pointer; display: none;
+  }
+</style>
+<script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+<script src="whep-player.js"></script>
+</head>
+<body>
+<video id="media" autoplay playsinline></video>
+<div id="hud">TabCast Relay — waiting for a stream…</div>
+<button id="playButton">▶ Play</button>
+
+<script>
+'use strict';
+
+var NAMESPACE = 'urn:x-cast:com.tabcast.relay';
+var video = document.getElementById('media');
+var hud = document.getElementById('hud');
+var playButton = document.getElementById('playButton');
+var currentHlsUrl = '';
+
+function setHud(text, small) {
+  hud.textContent = text;
+  hud.className = small ? 'small' : '';
+}
+
+var player = new TabCastWhep.WhepPlayer(video, function (name, detail) {
+  if (name === 'playing') setHud('TabCast Relay — live', true);
+  else if (name === 'connected') {
+    if (String(detail).indexOf('autoplay blocked') === 0) {
+      setHud('Stream connected — press play');
+      playButton.style.display = 'block';
+    } else setHud('TabCast Relay — connected', true);
+  } else if (name === 'signaling') setHud('Connecting to stream…');
+  else if (name === 'failed') fallbackToHls('WebRTC failed: ' + detail);
+  else if (name === 'ended') setHud('Stream ended');
+});
+
+async function startWhep(whepUrl, token) {
+  if (!whepUrl) return;
+  try {
+    await player.start(whepUrl, token || '');
+  } catch (e) {
+    fallbackToHls('WHEP error: ' + e.message);
+  }
+}
+
+function fallbackToHls(reason) {
+  if (currentHlsUrl) {
+    setHud(reason + ' — falling back to HLS');
+    video.srcObject = null;
+    video.src = currentHlsUrl;
+    video.play().catch(function () {
+      playButton.style.display = 'block';
+    });
+  } else {
+    setHud(reason + ' (no HLS fallback configured)');
+  }
+}
+
+function handlePayload(payload) {
+  if (!payload) return;
+  if (payload.hlsUrl) currentHlsUrl = payload.hlsUrl;
+  if (payload.whepUrl) startWhep(payload.whepUrl, payload.token || '');
+  else if (payload.hlsUrl) {
+    currentHlsUrl = payload.hlsUrl;
+    video.src = payload.hlsUrl;
+    video.play().catch(function () { playButton.style.display = 'block'; });
+  }
+}
+
+playButton.addEventListener('click', function () {
+  playButton.style.display = 'none';
+  video.play().catch(function (e) { setHud('Play failed: ' + e.message); });
+});
+
+function standaloneMode() {
+  var params = new URLSearchParams(location.search);
+  var whep = params.get('whep') || '';
+  var hls = params.get('hls') || '';
+  var token = params.get('token') || '';
+  if (!whep && !hls) {
+    setHud('TabCast Relay — standalone mode. Add ?whep=<WHEP URL> to play a stream.');
+    return;
+  }
+  handlePayload({ whepUrl: whep, hlsUrl: hls, token: token });
+}
+
+if (typeof cast !== 'undefined' && cast.framework && typeof cast.framework.CastReceiverContext !== 'undefined') {
+  var context = cast.framework.CastReceiverContext.getInstance();
+  var options = new cast.framework.CastReceiverOptions();
+  // We manage playback ourselves (WHEP/WebRTC); disable the default media
+  // shim so CAF does not try to take over the <video> element.
+  options.disableIdleTimeout = false;
+  context.addCustomMessageListener(NAMESPACE, function (event) {
+    var data = event.data || {};
+    if (typeof data === 'string') {
+      try { data = JSON.parse(data); } catch (e) { data = {}; }
+    }
+    handlePayload(data);
+  });
+  // Also accept a standard LOAD whose contentId points at our endpoints:
+  // a /whep contentId is played through the WHEP player; an .m3u8
+  // contentId is handed to the default CAF player by not intercepting.
+  context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, function () {
+    if (context.getSenders().length === 0) player.stop();
+  });
+  context.start(options);
+  setHud('TabCast Relay receiver ready — waiting for the sender…');
+} else {
+  standaloneMode();
+}
+</script>
+</body>
+</html>
